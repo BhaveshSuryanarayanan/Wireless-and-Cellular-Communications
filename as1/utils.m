@@ -83,6 +83,7 @@ methods(Static)
         end
         t = (0:Nfft-1)*Ts;
     end
+    
     function [tau_mean, tau_rms] = rmsDelaySpread(pg, tau)
 
         % Normalize PDP (important)
