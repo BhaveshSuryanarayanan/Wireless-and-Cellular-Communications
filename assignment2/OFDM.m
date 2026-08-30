@@ -36,6 +36,19 @@ classdef OFDM
             end
         end
 
+        function data_indices = data_subcarrier_indices(params)
+            N = params.numCarriers;
+            if isfield(params, 'pilots') && params.pilots
+                pilot_indices = OFDM.pilot_indices(params);
+            else
+                pilot_indices = [];
+            end
+            guard_indices = [params.guardTones, params.DCSubcarrier] + N/2 ;
+            
+            excluded = unique([guard_indices(:); pilot_indices(:)]);
+            data_indices = setdiff((1:N).', excluded, 'stable');
+        end
+
         function data_frame_indices = data_frame_indices(params)
             Nf = params.numFrames;
             blocks_per_frame = params.preamblePeriodicity;
@@ -49,22 +62,26 @@ classdef OFDM
             Lcp = params.prefixLength;
             r = reshape(r, N+Lcp, []);
             r = OFDM.remove_prefix(r, params);  % Remove CP before FFT
-            R = OFDM.DFT(r, params)/sqrt(N);
+            R = OFDM.DFT(r, params);%/sqrt(N);
         end
 
         function h = channelEstimate(R, params)
             pilot_indices = OFDM.pilot_indices(params);
             data_frame_indices = OFDM.data_frame_indices(params);
             N = params.numCarriers;
+            Lcp = params.prefixLength;
             numSymbols = length(data_frame_indices);
             ref = OFDM.getPilots(params);
             Rp = R(pilot_indices, data_frame_indices);  % Already correctly scaled from demodulate
             
-            if lower(params.estimationType) == "zf"
+            estimationType = lower(string(params.estimationType));
+
+            if estimationType == "zf"
                 H = zeros(N, numSymbols);
                 H(pilot_indices, :) = bsxfun(@rdivide, Rp, ref);
-                h = OFDM.IDFT(H, params)*sqrt(N);
-            elseif lower(params.estimationType) == "zf_linear_interpolate"
+                h = OFDM.IDFT(H, params);
+
+            elseif estimationType == "zf_linear_interpolate"
                 % First, get channel at pilot locations
                 H_pilots = bsxfun(@rdivide, Rp, ref);  % num_pilots x numSymbols
                 
@@ -75,54 +92,102 @@ classdef OFDM
                     H(:, sym) = interp1(pilot_indices, H_pilots(:, sym), (1:N).', 'linear', 'extrap');
                 end
                 
-                h = OFDM.IDFT(H, params);%*sqrt(N);
-
-            elseif lower(params.estimationType) == "zf_fft_interpolate"
-                % FFT-based interpolation: zero-pad in frequency domain
-                H_pilots = bsxfun(@rdivide, Rp, ref);  % num_pilots x numSymbols
-                
-                % For each symbol, use FFT-based interpolation
-                H = zeros(N, numSymbols);
-                for sym = 1:numSymbols
-                    % Create sparse frequency domain representation at pilot locations only
-                    H_sparse = zeros(N, 1);
-                    H_sparse(pilot_indices) = H_pilots(:, sym);
-                    
-                    % Transform to time domain
-                    h_time = OFDM.IDFT(H_sparse, params);
-                    
-                    % FFT back to frequency domain (gives interpolated response at all subcarriers)
-                    H(:, sym) = OFDM.DFT(h_time, params);
-                end
-                
-                h = OFDM.IDFT(H, params)*sqrt(N);
-            end
-                
                 h = OFDM.IDFT(H, params);
+
+            elseif lower(params.estimationType) == "zf_fft_interpolate" 
+                H_pilots = bsxfun(@rdivide, Rp, ref);  % num_pilots x numSymbols
+                H = zeros(N, numSymbols);
+                [pilot_idx_sorted, sort_order] = sort(pilot_indices(:));
+                query_idx = (1:N).';
+                fft_grid_len = length(pilot_idx_sorted) * params.pilotPeriodicity;
+                fft_grid = pilot_idx_sorted(1) + (0:fft_grid_len-1).';
+                for sym = 1:numSymbols
+                    H_fft_interp = interpft(H_pilots(sort_order, sym), fft_grid_len);
+                    H(:, sym) = interp1(fft_grid, H_fft_interp, query_idx, 'linear', 'extrap');
+                end
+                h = OFDM.IDFT(H, params);
+            elseif lower(params.estimationType) == "mls"
+                h = zeros(Lcp, numSymbols);       
+                for i = 1:numSymbols
+                    h(:, i) = OFDM.mLSestimation(Rp(:, i), ref, params);
+                end
+                h = [h ; zeros([N-Lcp numSymbols])]/sqrt(N);
+            
+            elseif lower(params.estimationType) == "mls_informed"
+                Nt = length(params.delays);
+
+                h = zeros(N, numSymbols);       
+                for i = 1:numSymbols
+                    h(params.delays+1, i) = OFDM.mLSestimation_informed(Rp(:, i), ref, params);
+                end
+                h = h/sqrt(N);
             end
         end
         
+        function h = mLSestimation(Yp, xp, params)
+            Lcp = params.prefixLength;
+            pilot_indices = OFDM.pilot_indices(params);
+            F = OFDM.getDFTMatrix(params);
+            Fp = F(pilot_indices, 1:Lcp);
+            Xp = diag(xp);
+            A = Xp*Fp;
+
+            h = (A' * A ) \  A' * Yp;
+        end
+        function h = mLSestimation_informed(Yp, xp, params)
+            Lcp = params.prefixLength;
+            pilot_indices = OFDM.pilot_indices(params);
+            F = OFDM.getDFTMatrix(params);
+            Fp = F(pilot_indices, params.delays+1);
+            Xp = diag(xp);
+            A = Xp*Fp;
+
+            h = (A' * A ) \  A' * Yp;
+        end
+
         function mse = channelMSE(h, hest, params)
             mse = 0;
-            h = h.';
             N = params.numCarriers;
-            h = [h ;zeros([N-length(h) 1])];
-            for i = 1:size(hest, 2)
-                mse = mse + mean(abs(h-hest(:, i)).^2);
-            end
+            estimationType = lower(string(params.estimationType));
 
+            excluded_indices = [params.guardTones(:); params.DCSubcarrier(:)] + N/2;
+            active_indices = setdiff((1:N).', excluded_indices, 'stable');
+
+            H = OFDM.DFT(h(:), params);
+            for i = 1:size(hest, 2)
+                Hest = OFDM.DFT(hest(:, i), params);
+                if estimationType == "zf"
+                    pilot_indices = OFDM.pilot_indices(params);
+                    Hcmp = H(pilot_indices);
+                    Hestcmp = Hest(pilot_indices);
+                else
+                    Hcmp = H(active_indices);
+                    Hestcmp = Hest(active_indices);
+                end
+
+                mse = mse + mean(abs(Hcmp - Hestcmp).^2);
+            end
+            mse = mse / size(hest,2);
         end
 
         function s = modulate(S, params)
             N = params.numCarriers;
-            s = OFDM.IDFT(S, params)*sqrt(N);
+            s = OFDM.IDFT(S, params);%*sqrt(N);
             s = OFDM.add_prefix(s, params);
             s = s(:);
         end
         function pilot_indices = pilot_indices(params) 
-            N = params.numCarriers;         
-            start_tone = min(params.upperGuardTones)-1;
-            end_tone = max(params.lowerGuardTones)+1;
+            N = params.numCarriers;
+            if isfield(params, 'upperGuardTones') && isfield(params, 'lowerGuardTones')
+                upper_guard_tones = params.upperGuardTones;
+                lower_guard_tones = params.lowerGuardTones;
+            else
+                upper_guard_tones = params.guardTones(params.guardTones > 0);
+                lower_guard_tones = params.guardTones(params.guardTones < 0);
+            end
+
+            start_tone = min(upper_guard_tones)-1;
+            end_tone = max(lower_guard_tones)+1;
             pilot_indices = (start_tone:-params.pilotPeriodicity:end_tone) + N/2;
         end
         function Sp = add_pilots(S, params)
@@ -184,6 +249,24 @@ classdef OFDM
             F = fftshift(fft(s, N, 1), 1);
         end
 
+        function W = getDFTMatrix(params)
+            % Generate DFT matrix for OFDM demodulation with DC-centered ordering
+            % 
+            % Returns: W - DFT matrix (N x N) with fftshift applied
+            %   Usage: F = W * s, where s is time-domain vector
+            %   Output F is DC-centered: [-N/2 ... N/2-1]
+            
+            N = params.numCarriers;
+            
+            % Standard DFT matrix (unshifted)
+            n = (0:N-1)';
+            k = (0:N-1);
+            W_standard = exp(-1j * 2 * pi * n * k / N) / sqrt(N);
+            
+            % Apply fftshift to get DC-centered ordering
+            % fftshift moves [0...N-1] to [-N/2...N/2-1]
+            W = fftshift(W_standard, 1);
+        end
 
         %%%%% Schmidl Cox Preamble %%%%%
         function preamble = generatePreamble(params)
@@ -261,6 +344,7 @@ classdef OFDM
             n = 0:Ns-1;
             r = r.';
             r = r.*exp(1j*2*pi*cfo*n*Ts);
+            h = h.';
         end
 
 
@@ -300,27 +384,7 @@ classdef OFDM
             N = params.numCarriers;
             Lcp = params.prefixLength;
             Np = params.preamblePeriodicity;
-            % r = reshape(r, N + Lcp, []);
             
-            
-            % rp = r(:,1:Np:end);
-            % numPreambles = size(rp, 2);
-            % win = N/2;
-            % z = zeros(Lcp+1, numPreambles);
-            % for col = 1:numPreambles
-                
-            %     x = [rp(:, col).'];
-            %     for d = 1:length(x)-N;
-            %         a = x(d : d + win- 1);
-            %         b = x(d + N/2 : d + N/2+win - 1);
-            %         P = sum(a .* conj(b));
-            %         R = sum(abs(b).^2);
-            %         if R > 0
-            %             z(d, col) = abs(P)^2 / R^2;
-            %         end
-            %     end
-            % end
-
             rp = r(:);
             z = zeros([1 length(rp)-N]);
             for i=1:length(rp)-N
@@ -331,6 +395,54 @@ classdef OFDM
                 z(i) = abs(P^2)/R^2;
                 % z(i) = abs(P^2);
             end
+        end
+
+        function plotChannelEstimationPerformance(snrs, mses, estimationTypes)
+            % Plot channel estimation MSE vs SNR for different methods
+            %
+            % Usage:
+            %   OFDM.plotChannelEstimationPerformance(snrs, mses, estimationTypes)
+            %
+            % Inputs:
+            %   snrs: SNR values in dB (1 x numSNRs)
+            %   mses: MSE matrix (numMethods x numSNRs)
+            %   estimationTypes: String array of method names
+            
+            mses_db = 10*log10(mses);
+            
+            figure('Position', [100, 100, 1000, 600]);
+            hold on;
+            grid on;
+            
+            % Define colors and markers for different methods
+            colors = lines(length(estimationTypes));
+            markers = {'o', 's', '^', 'd', 'v'};
+            
+            % Plot each estimation method
+            for i = 1:length(estimationTypes)
+                marker_idx = mod(i-1, length(markers)) + 1;
+                plot(snrs, mses_db(i, :), ...
+                    'Color', colors(i, :), ...
+                    'Marker', markers{marker_idx}, ...
+                    'LineWidth', 2, ...
+                    'MarkerSize', 8, ...
+                    'DisplayName', estimationTypes(i));
+            end
+            
+            % Labels and formatting
+            xlabel('SNR (dB)', 'FontSize', 12, 'FontWeight', 'bold');
+            ylabel('Channel Estimation MSE (dB)', 'FontSize', 12, 'FontWeight', 'bold');
+            title('Channel Estimation Performance Comparison', 'FontSize', 14, 'FontWeight', 'bold');
+            
+            legend('Location', 'best', 'FontSize', 11, 'Interpreter', 'none');
+            grid on;
+            grid minor;
+            
+            % Set axis properties
+            xlim([snrs(1), snrs(end)]);
+            set(gca, 'FontSize', 11);
+            
+            hold off;
         end
 
     end

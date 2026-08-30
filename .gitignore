@@ -1,0 +1,7 @@
+# MATLAB autosaves / build artifacts
+*.asv
+*.asv.*
+slprj/
+
+# Large reference textbooks (kept on disk, not in git)
+books/
